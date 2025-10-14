@@ -1,4 +1,4 @@
-# TikTok Doomscroller
+# TikTok Doomscroller v0.1
 ## Author: Chris Vazquez (chris_v@mit.edu)
 ### A Shiny app to help coders manually review TikTok videos from a list of URLs in a Google Sheet
 
@@ -20,7 +20,7 @@ CODER_NAMES <- c("Minerva", "Sarita", "Mona", "Evan", "Claire", "Cami")
 # FIXME: Test URL sheet
 SHEET_URL <- "https://docs.google.com/spreadsheets/d/1BdZ-Ikbd-7yvS8CmrXLTtAHO6k_Hxi6hraanp_svoCY/edit?usp=sharing" 
 options(gargle_oauth_email = TRUE)
-
+gs4_auth(cache = ".secrets")
 
 # ----- Helper Functions -----
 extract_video_id <- function(url) {
@@ -64,8 +64,135 @@ read_source_urls <- function(ss_url){
 # 1) Big Raid? -> binary coded 1 (Yes) / 0 (No) saved as characters "1"/"0"
 # 2) Agency?   -> open-ended text
 question_spec <- list(
-  list(id = "big_raid", label = "Big Raid?", type = "radio", choices = c("No" = "0", "Yes" = "1")),
-  list(id = "agency",   label = "Agency?",   type = "text")
+  # Event metadata
+  list(id="event_date", type="text", label="Event date (DD-MM-YYYY)"),
+  list(id="event_time", type="text", label="Event time (HH:MM)"),
+  list(id="event_state", type="text", label="State (2-letter)"),
+  list(id="event_city", type="text", label="City"),
+  list(id="event_neighborhood", type="text", label="Neighborhood"),
+  list(id="event_address", type="text", label="Street address"),
+  list(id="event_location_text", type="textArea", label="Location description"),
+  
+  # Location type + conditional other
+  list(id="location_type", type="select", label="Location type",
+       choices=c("business_or_workplace","parking_lot","public_street","checkpoint",
+                 "courthouse","private_residence","other")),
+  list(id="location_type_other", type="text", label="If 'other', describe",
+       show_if=list(field="location_type", equals="other")),
+  
+  # Raid & agencies
+  list(id="big_raid", type="radio", label="Big raid?", choices=c("No"="0","Yes"="1")),
+  list(id="federal_agencies", type="select", label="Federal agencies involved",
+       choices=c("ICE","CBP","DEAR","ATF","FBI","national_guard","other_unclear")),
+  
+  # Local police + conditional agency text
+  list(id="local_police_presence", type="radio", label="Local/state police present?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="local_police_agencies", type="text",
+       label="Name local/state police agencies (if any)",
+       show_if=list(field="local_police_presence", equals="1")),
+  
+  # Counts & equipment
+  list(id="agent_count_visible", type="text", label="Agents visible (count)"),
+  list(id="agent_cars_visible", type="text", label="Agent vehicles visible (count)"),
+  list(id="Masks_visible", type="text", label="Agents wearing masks (count)"),
+  list(id="tacticalvests_visible", type="radio", label="Any tactical vests?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="other_militarized_equipment", type="textArea",
+       label="Other militarized equipment"),
+  
+  # Agent demographics & language
+  list(id="any_latino_agents", type="radio", label="Any agents appear Latino/Hispanic?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="any_black_agents", type="radio", label="Any agents appear Black/African American?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="officer_speak_spanish", type="radio", label="Any officers speak Spanish?",
+       choices=c("No"="0","Yes"="1")),
+  
+  # Bystanders: counts & estimates
+  list(id="bystander_count_visible", type="text", label="Bystanders visible (count)"),
+  list(id="bystander_est", type="select", label="Estimated crowd size",
+       choices=c("<5","5-10","10-20","20+")),
+  list(id="bystander_other_phones_visible_count", type="text",
+       label="Other recording phones visible (count)"),
+  
+  # Bystander actions (all binary unless noted)
+  list(id="bystanders_engage_officers", type="radio", label="Bystanders engage officers?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="bystanders_engage_targets", type="radio", label="Bystanders engage targets?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="bystanders_question_officers", type="radio", label="Bystanders question officers?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="bystanders_refer_identity", type="radio", label="Bystanders refer to officers' identity?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="bystanders_legal_language_warrants", type="radio",
+       label="Bystanders use legal language / mention warrants?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="bystanders_yell_at_officers", type="radio", label="Bystanders yell at officers?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="bystanders_curse_or_insult", type="radio", label="Bystanders curse/insult?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="bystanders_english", type="radio", label="Bystanders speak English?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="bystanders_spanish", type="radio", label="Bystanders speak Spanish?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="bystanders_otherlanguage", type="radio", label="Bystanders speak other languages?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="bystanders_body_blocking", type="radio", label="Bystanders body-block officers?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="bystanders_holding_target", type="radio", label="Bystanders hold onto target?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="bystanders_holding_officer", type="radio", label="Bystanders hold back officers?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="bystanders_org_membership", type="radio", label="Bystanders identify as org members?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="bystanders_throw", type="radio", label="Bystanders throw objects?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="bystanders_cars", type="radio", label="Bystanders use cars strategically?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="bystanders_bodyblockade", type="radio", label="Bystanders form a body blockade?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="bystanders_chase", type="radio", label="Bystanders chase/follow agents?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="bystanders_brieftext", type="text", label="Brief description of bystander actions"),
+  
+  # Outcomes (all binary)
+  list(id="outcomes_ICE_emptyhanded", type="radio", label="ICE leaves empty-handed?",
+       choices=c("No"="0","Yes"="1")),
+  
+  list(id="outcome_target_ICE_pulls_gun", type="radio", label="Officers pull gun on target?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="outcome_target_ICE_shoves", type="radio", label="Officers shove target?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="outcome_target_ICE_tackles", type="radio", label="ICE tackles target?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="outcome_target_ICE_restraints", type="radio", label="Restrain target physically?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="outcome_target_ICE_punches_or_kicks", type="radio",
+       label="Officers punch/kick target?", choices=c("No"="0","Yes"="1")),
+  list(id="outcomes_target_arrest_binary", type="radio", label="Target arrested?",
+       choices=c("No"="0","Yes"="1")),
+  
+  list(id="outcome_bystander_ICE_pulls_gun", type="radio", label="Pull gun on bystander?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="outcome_bystander_ICE_shoves", type="radio", label="Shove bystander?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="outcome_bystander_ICE_tackles", type="radio", label="Tackle bystander?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="outcome_bystander_ICE_restraints", type="radio", label="Restrain bystander?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="outcome_bystander_ICE_punches_or_kicks", type="radio",
+       label="Punch/kick bystander?", choices=c("No"="0","Yes"="1")),
+  list(id="outcome_bystander_carhit", type="radio", label="Bystander hit by vehicle?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="outcome_bystanders_ICE_threaten", type="radio", label="ICE threatens bystanders?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="outcome_ICE_takephone", type="radio", label="ICE takes someone’s phone?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="outcome_ICE_blockphone", type="radio", label="ICE blocks filming/observation?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="outcome_bystanders_arrested", type="radio", label="Bystanders arrested?",
+       choices=c("No"="0","Yes"="1"))
 )
 question_header <- function(){
   tibble::tibble(!!!setNames(rep(list(character()), length(question_spec)),
@@ -74,20 +201,20 @@ question_header <- function(){
 
 
 # ----- UI -----
-
 ui <- fluidPage(
   useShinyjs(),
   tags$head(tags$style(HTML('
     .topbar { position:sticky; top:0; z-index:100; background:#fff; border-bottom:1px solid #eee; padding:0.75rem 0; }
     .controls { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; }
     .meta { font-size:.9rem; color:#666; margin-left:.5rem; }
-    .viewer-wrap { display:flex; justify-content:flex-start; }
     .player-col { display:flex; justify-content:center; }
+    .player-sticky { position: sticky; top: 72px; }  /* keep video in view; match topbar height */
+    .qa-panel { max-height: calc(100vh - 96px); overflow: auto; } /* independent scroll for questions */
     .q-card { background:#fafafa; border:1px solid #eee; border-radius:12px; padding:1rem; }
-    .btn-primary { background:#1f6feb; border-color:#1f6feb; }
-    .btn-success { background:#2da44e; border-color:#2da44e; }
+    .viewer-iframe { width:100%; max-width:520px; aspect-ratio:9/16; border:none; }
   '))),
-  titlePanel(NULL),  # remove default big title spacing
+  titlePanel(NULL),
+  
   # Top controls (no sidebar)
   div(class = "topbar",
       div(class = "container-fluid",
@@ -103,18 +230,19 @@ ui <- fluidPage(
       )
   ),
   
-  # Main content: left = video (bigger), right = questions
+  # Main content: left = sticky video, right = scrollable questions
   div(class = "container-fluid",
       fluidRow(
         column(
           width = 7, class = "player-col",
-          div(class = "viewer-wrap",
-              div(style = "width:100%; max-width:520px;", uiOutput("embed", container = div))
+          div(class = "player-sticky",
+              # keep it minimal so the iframe sizes correctly
+              uiOutput("embed", container = div)
           )
         ),
         column(
           width = 5,
-          div(class = "q-card",
+          div(class = "q-card qa-panel",
               h4("Questions"),
               uiOutput("questionnaire")
           )
