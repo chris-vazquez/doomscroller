@@ -15,30 +15,48 @@ library(tidyverse)
 library(googlesheets4)
 library(shinyjs)
 
-# Tabs used by the new design:
-# - assignments: per-RA ordered list of videos to code
-# - responses:   append-only log of completed items
-# - cursors:     one row per RA = where to resume (blank answers; no partial saves)
-ASSIGN_TAB    <- "assignments"
-RESPONSES_TAB <- "responses"
-CURSOR_TAB    <- "cursors"
+# Tabs in the Google sheet:
+ASSIGN_TAB    <- Sys.getenv("ASSIGN_TAB",    unset = "assignments")
+RESPONSES_TAB <- Sys.getenv("RESPONSES_TAB", unset = "responses")
+CURSOR_TAB    <- Sys.getenv("CURSOR_TAB",    unset = "cursors")
 
-# RA names must match exactly what appears in the assignments sheet
+# RA Names
+# FIXME: replace with real names
 CODER_NAMES <- c("Ariel", "Marcel", "Chris")
 
-# Your working Google Sheet (keep using your own account for now)
-SHEET_URL <- "https://docs.google.com/spreadsheets/d/1BdZ-Ikbd-7yvS8CmrXLTtAHO6k_Hxi6hraanp_svoCY/edit?usp=sharing"
-
-# Auth: local development using your own Google account
-# FIXME: change to service account soon
-options(gargle_oauth_email = TRUE)
-gs4_auth(cache = ".secrets")
-
-# Small helper used later (safe null-coalescing)
+# safe null-coalescing
 `%||%` <- function(x, y) if (is.null(x) || length(x) == 0) y else x
 
-# (Optional while developing: fuller error traces)
+# Error Tracing
+# FIXME: Remove after finished
 options(shiny.fullstacktrace = TRUE)
+
+
+
+# ----- Authentication -----
+
+# Google Sheet
+SHEET_URL <- "https://docs.google.com/spreadsheets/d/1BdZ-Ikbd-7yvS8CmrXLTtAHO6k_Hxi6hraanp_svoCY/edit?usp=sharing"
+
+# Authentication from Google
+sa <- Sys.getenv("GCP_SA_JSON", unset = "service-account.json") 
+
+if (nzchar(sa)) {
+  if (file.exists(sa)) {
+    # Case A: you set GCP_SA_JSON to "service-account.json" and bundled the file
+    gs4_auth(path = sa)
+  } else {
+    # Case B: you pasted the JSON contents into the env var
+    tf <- tempfile(fileext = ".json")
+    writeLines(sa, tf)
+    gs4_auth(path = tf)
+  }
+} else {
+  # Local dev convenience (will NOT run on shinyapps.io if env var is set)
+  options(gargle_oauth_email = TRUE)
+  gs4_auth(cache = ".secrets")
+}
+
 
 # ----- Helper Functions -----
 
@@ -64,21 +82,36 @@ make_tiktok_iframe <- function(video_id){
   )
 }
 
+# Build canonical TikTok URL (no query params)
+canonical_tiktok_url <- function(user_id, video_id) {
+  user_id  <- as.character(user_id)
+  video_id <- as.character(video_id)
+  is_bad <- is.na(user_id) | user_id == "" | is.na(video_id) | video_id == ""
+  out <- sprintf("https://www.tiktok.com/@%s/video/%s", user_id, video_id)
+  out[is_bad] <- NA_character_
+  out
+}
+
+# Strip query string and fragments from any URL
+strip_query <- function(url) {
+  url <- as.character(url)
+  sub("([?#].*)$", "", url)
+}
+
 # Ensure required tabs exist with the correct headers (and fix if mismatched)
 ensure_tabs <- function(ss){
   nms <- tryCatch(googlesheets4::sheet_names(ss), error = function(e) character())
   
-  # helpers
   get_headers <- function(tab) names(googlesheets4::read_sheet(ss, sheet = tab, n_max = 0, .name_repair = "minimal"))
   write_headers <- function(tab, headers) {
-    # Make a single-row data.frame with one column per header cell
     df <- as.data.frame(matrix(headers, nrow = 1), stringsAsFactors = FALSE)
     googlesheets4::range_write(ss, data = df, sheet = tab, range = "A1", col_names = FALSE)
   }
   
-  # RESPONSES
+  # >>> UPDATED: add gate flags to responses header <<<
   resp_expected <- c(
     "timestamp","coder_id","index_order","URL","user_id","video_id",
+    "relevant_video","link_active",              # <-- NEW
     names(question_header())
   )
   if(!(RESPONSES_TAB %in% nms)){
@@ -88,15 +121,11 @@ ensure_tabs <- function(ss){
   } else {
     hdr <- get_headers(RESPONSES_TAB)
     if (!identical(hdr, resp_expected)) {
-      # Only safe to rewrite if the sheet is empty or you want to migrate now
-      # If there are no data rows, just rewrite:
       if (nrow(googlesheets4::read_sheet(ss, sheet = RESPONSES_TAB, .name_repair = "minimal")) == 0) {
         write_headers(RESPONSES_TAB, resp_expected)
       } else if (!"index_order" %in% hdr && all(c("index_random","index_source") %in% hdr)) {
-        # Basic migration: replace headers; prior data won't have index_order; leave blank
         write_headers(RESPONSES_TAB, resp_expected)
       }
-      # else: leave as-is; you can manually migrate if needed
     }
   }
   
@@ -147,7 +176,9 @@ read_assignments_for <- function(ss, coder_id){
     dplyr::mutate(
       URL = trimws(as.character(URL)),
       video_id = dplyr::if_else(is.na(video_id) | video_id == "", extract_video_id(URL), video_id),
-      user_id  = dplyr::if_else(is.na(user_id)  | user_id  == "", extract_user_id(URL),  user_id)
+      user_id  = dplyr::if_else(is.na(user_id)  | user_id  == "", extract_user_id(URL),  user_id),
+      canonical_url = dplyr::coalesce(canonical_tiktok_url(user_id, video_id),
+                               strip_query(URL))
     ) %>%
     dplyr::arrange(index_order)
   validate(need(nrow(df) > 0, sprintf("No assignments for coder '%s' in 'assignments'.", coder_id)))
@@ -159,11 +190,15 @@ read_completed_idx <- function(ss, coder_id){
   if(!(RESPONSES_TAB %in% googlesheets4::sheet_names(ss))) return(integer(0))
   rs <- googlesheets4::read_sheet(ss, sheet = RESPONSES_TAB, .name_repair = "minimal")
   if (!"index_order" %in% names(rs)) return(integer(0))
-  rs %>%
+  
+  idx <- rs %>%
     dplyr::filter(coder_id == !!coder_id) %>%
-    dplyr::pull(index_order) %>%
-    unique() %>%
-    sort()
+    dplyr::pull(index_order)
+  
+  # flatten and coerce robustly
+  idx <- suppressWarnings(as.integer(as.character(unlist(idx))))
+  idx <- idx[!is.na(idx)]
+  sort(unique(idx))
 }
 
 # Cursors: read/set/clear (one row per coder_id)
@@ -210,12 +245,50 @@ clear_cursor <- function(ss, coder_id){
   )
 }
 
+# Header Correction when needed
+##migrate_responses_header <- function(ss) {
+  # Read current data (keeps all existing rows)
+  #resp <- googlesheets4::read_sheet(ss, sheet = RESPONSES_TAB, .name_repair = "minimal")
+  
+  # Build the expected header (matches your app logic)
+  #expected <- c(
+    #"timestamp","coder_id","index_order","URL","user_id","video_id",
+    #"relevant_video","link_active",        # <-- new gate flags
+    #names(question_header())               # <-- includes ALL question_spec ids,
+    #     e.g. spanish_majority, video_complete
+  #)
+  
+  # Add any missing columns as blank character columns
+  #missing <- setdiff(expected, names(resp))
+  #if (length(missing)) {
+  #  for (col in missing) resp[[col]] <- NA_character_
+  #}
+  
+  # Keep only expected columns in the expected order
+  #resp <- resp[, expected, drop = FALSE]
+  
+  # Overwrite the sheet with corrected header + the same data
+  #googlesheets4::sheet_write(resp, ss = ss, sheet = RESPONSES_TAB)
+  
+  #invisible(TRUE)
+#}
 
 
 # ----- Coding Questions -----
 # 1) Big Raid? -> binary coded 1 (Yes) / 0 (No) saved as characters "1"/"0"
 # 2) Agency?   -> open-ended text
 question_spec <- list(
+  # Beginning Flags
+  ## Spanish Video?
+  list(id="spanish_majority", type="radio",
+       label="Is most dialogue in Spanish?",
+       choices=c("No"="0","Yes"="1")),
+  ## Complete Event?
+  list(id="video_complete", type="radio",
+       label="Does this video show a complete event (beginning/middle/end)?",
+       choices=c("No"="0","Yes"="1")),
+  
+  
   # Event metadata
   list(id="event_date", type="text", label="Event date (MM-DD-YYYY)"),
   list(id="event_time", type="text", label="Event time (HH:MM)"),
@@ -235,7 +308,7 @@ question_spec <- list(
   # Raid & agencies
   list(id="big_raid", type="radio", label="Big raid?", choices=c("No"="0","Yes"="1")),
   list(id="federal_agencies", type="select", label="Federal agencies involved",
-       choices=c("ICE","CBP","DEAR","ATF","FBI","national_guard","other_unclear")),
+       choices=c("ICE","CBP","DEA","ATF","FBI","national_guard","other_unclear")),
   
   # Local police + conditional agency text
   list(id="local_police_presence", type="radio", label="Local/state police present?",
@@ -264,7 +337,7 @@ question_spec <- list(
   # Bystanders: counts & estimates
   list(id="bystander_count_visible", type="text", label="Bystanders visible (count)"),
   list(id="bystander_est", type="select", label="Estimated crowd size",
-       choices=c("<5","5-10","10-20","20+")),
+       choices=c("<5","5-9","10-19","20+")),
   list(id="bystander_other_phones_visible_count", type="text",
        label="Other recording phones visible (count)"),
   
@@ -351,20 +424,25 @@ question_header <- function(){
                              vapply(question_spec, function(q) q$id, character(1))))
 }
 
-
 # ----- UI -----
 ui <- fluidPage(
   useShinyjs(),
   tags$head(tags$style(HTML('
-  .topbar { position:sticky; top:0; z-index:100; background:#fff; border-bottom:1px solid #eee; padding:0.75rem 0; }
-  .controls { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; }
-  .meta { font-size:.9rem; color:#666; margin-left:.5rem; }
+    .topbar { position: sticky; top: 0; z-index: 1000; background:#fff; border-bottom:1px solid #eee; padding:0.75rem 0; }
+    .controls { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; }
+    .meta { font-size:.9rem; color:#666; margin-left:.5rem; }
 
-  .player-col { display:flex; justify-content:center; align-items:center; height: calc(100vh - 96px); }
-  .player-sticky { position: sticky; top: 72px; }
-  .qa-panel { max-height: calc(100vh - 96px); overflow: auto; }
-  .q-card { background:#fafafa; border:1px solid #eee; border-radius:12px; padding:1rem; }
-  .viewer-iframe { width:100%; max-width:600px; aspect-ratio:9/16; border:none; }
+    /* instructions banner directly under topbar */
+    .ra-instructions { position: sticky; top: 56px; z-index: 900; background:#f7fafc; border:1px solid #eaecef; border-radius:8px; padding:.75rem; margin:.5rem 0; }
+
+    /* left column player */
+    .player-col { display:flex; justify-content:center; align-items:center; height: calc(100vh - 96px); }
+    /* raise the sticky offset so it clears both topbar + banner */
+    .player-sticky { position: sticky; top: 160px; z-index: 1; }
+
+    .qa-panel { max-height: calc(100vh - 96px); overflow: auto; }
+    .q-card { background:#fafafa; border:1px solid #eee; border-radius:12px; padding:1rem; }
+    .viewer-iframe { width:100%; max-width:600px; aspect-ratio:9/16; border:none; }
   '))),
   titlePanel(NULL),
   
@@ -372,14 +450,29 @@ ui <- fluidPage(
   div(class = "topbar",
       div(class = "container-fluid",
           div(class = "controls",
-              h3("TikTok DoomScroller", style="margin:0 1rem 0 0;"),
+              h3("Bystander TikTok Coding v1", style="margin:0 1rem 0 0;"),
               selectInput("coder_id", label = NULL, choices = CODER_NAMES,
                           width = "200px", selected = CODER_NAMES[1]),
               actionButton("load_list", "Load / Resume", class = "btn btn-primary"),
               actionButton("save_and_next", "Save & Next", class = "btn btn-success"),
-              actionButton("skip", "Skip", class = "btn btn-secondary"),
+              actionButton("mark_irrelevant", "Mark Irrelevant", class = "btn btn-warning"),
+              actionButton("mark_link_broken", "Mark Link Broken", class = "btn btn-danger"),
               span(class = "meta", textOutput("position", inline = TRUE)),
               span(class = "meta", textOutput("current_info", inline = TRUE))
+          )
+      )
+  ),
+  
+  # Instructions banner (sticky under topbar)
+  div(class="container-fluid",
+      div(class="ra-instructions",
+          tags$b("Workflow: "),
+          tags$ol(
+            tags$li("Select your name from the dropdown and click ", tags$b("Load/Resume"), "to begin each session."),
+            tags$li("Code only what you can see/hear. Click ", tags$b("Save & Next"), "when you're done with each video."),
+            tags$li("If a video seems really irrelvant, click ", tags$b("Mark Irrelevant"), 
+                    ". If the video appears broken or is not loading correctly, click", tags$b("Mark Link Broken"), "."),
+            tags$li("Use the original TikTok link (below) if you need full context/comments. Make sure you're signed into your TikTok account.")
           )
       )
   ),
@@ -404,25 +497,18 @@ ui <- fluidPage(
   )
 )
 
-
 # ----- Server -----
 server <- function(input, output, session){
   rv <- reactiveValues(
-    ss      = NULL,    # sheet url
-    data    = NULL,    # this coder's assignments (ordered)
-    idx_pos = 1L,      # 1-based row position within rv$data
+    ss      = NULL,
+    data    = NULL,
+    idx_pos = 1L,
     ready   = FALSE
   )
   
-  # Arrow key: Right → Skip (no save)
-  runjs('document.addEventListener("keydown", function(e){
-           if(e.key === "ArrowRight"){ Shiny.setInputValue("_k_next", Math.random()); }
-         });')
-  observeEvent(input$`_k_next`, { 
-    if (rv$ready) advance_without_save()
-  }, ignoreInit = TRUE)
+  # >>> REMOVED: Right-arrow hotkey and skip trigger
+  # runjs(...) and observeEvent(input$`_k_next`, ...)  -- delete both
   
-  # Load / Resume the coder's list and set cursor
   observeEvent(input$load_list, {
     req(input$coder_id)
     showNotification("Loading your list…", type = "message", duration = 2)
@@ -430,13 +516,9 @@ server <- function(input, output, session){
     rv$ss <- SHEET_URL
     ensure_tabs(rv$ss)
     
-    # Pull ordered list for this coder
     assign_df <- read_assignments_for(rv$ss, input$coder_id)
     rv$data <- assign_df
     
-    # Determine starting position:
-    # 1) If a cursor exists (incomplete item), resume that item (blank answers).
-    # 2) Otherwise, jump to the first not-yet-completed item.
     cur <- read_cursor(rv$ss, input$coder_id)
     completed_idx <- read_completed_idx(rv$ss, input$coder_id)
     
@@ -451,7 +533,6 @@ server <- function(input, output, session){
       } else {
         next_idx_order <- min(remaining)
         rv$idx_pos <- which(rv$data$index_order == next_idx_order)[1]
-        # Set cursor so quitting now resumes on this item
         set_cursor(rv$ss, input$coder_id, next_idx_order, rv$data$video_id[[rv$idx_pos]])
       }
     }
@@ -459,13 +540,11 @@ server <- function(input, output, session){
     rv$ready <- TRUE
   })
   
-  # Convenience accessors
   cur_row <- reactive({
     req(rv$ready)
     rv$data[rv$idx_pos, , drop = FALSE]
   })
   
-  # Position + current info (top bar)
   output$position <- renderText({
     req(rv$ready)
     paste0("Item ", rv$idx_pos, " of ", nrow(rv$data))
@@ -476,7 +555,6 @@ server <- function(input, output, session){
     paste0("(index ", r$index_order, " • video ", r$video_id, ")")
   })
   
-  # Video embed (left column)
   output$embed <- renderUI({
     req(rv$ready)
     vid <- cur_row()$video_id
@@ -484,16 +562,19 @@ server <- function(input, output, session){
     make_tiktok_iframe(vid)
   })
   
-  # Questionnaire (right column) – always blank on load/advance (no partial saves)
+  # >>> Radios start blank (selected = character(0)); URL is clickable link
   output$questionnaire <- renderUI({
     req(rv$ready)
     r <- cur_row()
     tagList(
-      div(style="margin-bottom:.5rem; font-size:.9rem; color:#666; word-break:break-all;",
-          strong("URL: "), r$URL),
+      div(style="margin-bottom:.5rem; font-size:.9rem; word-break:break-all;",
+          strong("Original: "),
+          tags$a(href = r$canonical_url, target = "_blank", r$canonical_url)
+      ),
       lapply(question_spec, function(q){
         switch(q$type,
-               radio    = radioButtons(q$id, q$label, choices = q$choices, inline = TRUE),
+               radio    = radioButtons(q$id, q$label, choices = q$choices, inline = TRUE,
+                                       selected = character(0)),  # <-- start blank
                text     = textInput(q$id, q$label),
                textArea = textAreaInput(q$id, q$label, rows = 4),
                checkbox = checkboxGroupInput(q$id, q$label, choices = q$choices),
@@ -504,7 +585,19 @@ server <- function(input, output, session){
     )
   })
   
-  # Collect answers from inputs (as character strings)
+  # >>> Allow unclicking radios (toggle off on second click)
+  runjs("
+    $(document).on('click', '.shiny-input-radiogroup input[type=radio]', function(){
+      var $this = $(this);
+      if ($this.data('waschecked')) {
+        $this.prop('checked', false).data('waschecked', false).trigger('change');
+      } else {
+        $('input[name=\"' + $this.attr('name') + '\"]').data('waschecked', false);
+        $this.data('waschecked', true);
+      }
+    });
+  ")
+  
   gather_responses <- function(){
     vals <- lapply(question_spec, function(q){
       v <- input[[q$id]]
@@ -513,15 +606,18 @@ server <- function(input, output, session){
     setNames(as.list(vals), vapply(question_spec, function(q) q$id, character(1)))
   }
   
-  # Advance cursor without saving (Skip)
-  advance_without_save <- function(){
+  # >>> Advance helper (shared)
+  advance_to_next <- function(){
     req(rv$ready)
-    if (rv$idx_pos < nrow(rv$data)) {
-      rv$idx_pos <- rv$idx_pos + 1L
-      # update cursor to new item
-      r <- cur_row()
-      set_cursor(rv$ss, input$coder_id, r$index_order, r$video_id)
-      # clear UI inputs
+    completed_idx <- read_completed_idx(rv$ss, input$coder_id)
+    remaining <- setdiff(rv$data$index_order, completed_idx)
+    if (length(remaining) == 0) {
+      clear_cursor(rv$ss, input$coder_id)
+      showNotification("Saved. All done! 🎉", type = "message")
+    } else {
+      next_idx_order <- min(remaining)
+      rv$idx_pos <- which(rv$data$index_order == next_idx_order)[1]
+      set_cursor(rv$ss, input$coder_id, next_idx_order, rv$data$video_id[[rv$idx_pos]])
       lapply(question_spec, function(q){
         switch(q$type,
                radio    = updateRadioButtons(session, q$id, selected = character(0)),
@@ -531,17 +627,15 @@ server <- function(input, output, session){
                select   = updateSelectInput(session, q$id, selected = "")
         )
       })
-    } else {
-      showNotification("You reached the end of your list.", type = "message")
     }
   }
-  observeEvent(input$skip, { advance_without_save() })
   
-  # Save completed response and move to next
+  # >>> REMOVED: observeEvent(input$skip, ...)
+  
+  # Save full response and move next (unchanged)
   save_response <- function(){
     req(rv$ready)
     r <- cur_row()
-    
     payload <- tibble::tibble(
       timestamp    = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
       coder_id     = input$coder_id %||% "",
@@ -553,44 +647,60 @@ server <- function(input, output, session){
     
     tryCatch({
       googlesheets4::sheet_append(ss = rv$ss, data = payload, sheet = RESPONSES_TAB)
-      
-      # After saving, recompute remaining and advance cursor
-      completed_idx <- read_completed_idx(rv$ss, input$coder_id)
-      remaining <- setdiff(rv$data$index_order, completed_idx)
-      
-      if (length(remaining) == 0) {
-        clear_cursor(rv$ss, input$coder_id)
-        showNotification("Saved. All done! 🎉", type = "message")
-      } else {
-        next_idx_order <- min(remaining)
-        next_pos <- which(rv$data$index_order == next_idx_order)[1]
-        rv$idx_pos <- next_pos
-        set_cursor(rv$ss, input$coder_id, next_idx_order, rv$data$video_id[[rv$idx_pos]])
-        # clear UI inputs for the next item
-        lapply(question_spec, function(q){
-          switch(q$type,
-                 radio    = updateRadioButtons(session, q$id, selected = character(0)),
-                 text     = updateTextInput(session, q$id, value = ""),
-                 textArea = updateTextAreaInput(session, q$id, value = ""),
-                 checkbox = updateCheckboxGroupInput(session, q$id, selected = character(0)),
-                 select   = updateSelectInput(session, q$id, selected = "")
-          )
-        })
-      }
+      advance_to_next()
       TRUE
     }, error = function(e){
       showNotification(paste("Write error:", e$message), type = "error", duration = 8)
       FALSE
     })
   }
-  
   observeEvent(input$save_and_next, {
     ok <- save_response()
-    if (ok) {
-      showNotification("Saved.", type = "message", duration = 1.5)
-    }
+    if (ok) showNotification("Saved.", type = "message", duration = 1.5)
+  })
+  
+  # >>> NEW: mark & advance helpers
+  save_flag_and_advance <- function(flag_col, flag_value){
+    req(rv$ready)
+    r <- cur_row()
+    meta <- list(
+      timestamp   = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+      coder_id    = input$coder_id %||% "",
+      index_order = r$index_order,
+      URL         = r$URL,
+      user_id     = r$user_id,
+      video_id    = r$video_id
+    )
+    
+    # Build payload with first 8 columns EXACTLY matching the sheet order.
+    # (remaining question columns will stay blank in the sheet, which is fine)
+    payload <- tibble::tibble(
+      timestamp    = meta$timestamp,
+      coder_id     = meta$coder_id,
+      index_order  = as.character(meta$index_order),
+      URL          = meta$URL,
+      user_id      = meta$user_id,
+      video_id     = meta$video_id,
+      relevant_video = if (identical(flag_col, "relevant_video")) flag_value else NA_character_,
+      link_active    = if (identical(flag_col, "link_active"))    flag_value else NA_character_
+    )
+    
+    googlesheets4::sheet_append(ss = rv$ss, data = payload, sheet = RESPONSES_TAB)
+    advance_to_next()
+  }
+  
+  observeEvent(input$mark_irrelevant, {
+    save_flag_and_advance("relevant_video", "No")
+    showNotification("Marked irrelevant and advanced.", type = "message")
+  })
+  observeEvent(input$mark_link_broken, {
+    save_flag_and_advance("link_active", "No")
+    showNotification("Marked link broken and advanced.", type = "message")
   })
 }
+
+# Add this line when adding new questions
+##migrate_responses_header(SHEET_URL)
 
 shinyApp(ui, server)
 
