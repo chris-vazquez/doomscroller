@@ -22,7 +22,7 @@ CURSOR_TAB    <- Sys.getenv("CURSOR_TAB",    unset = "cursors")
 
 # RA Names
 # FIXME: replace with real names
-CODER_NAMES <- c("Ariel", "Marcel", "Chris")
+CODER_NAMES <- c("Cami", "Claire", "Evan", "Minerva", "Mona", "Sarita", "Chris")
 
 # safe null-coalescing
 `%||%` <- function(x, y) if (is.null(x) || length(x) == 0) y else x
