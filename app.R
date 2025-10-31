@@ -74,7 +74,7 @@ extract_user_id <- function(url) {
 make_tiktok_iframe <- function(video_id){
   req(video_id)
   tags$iframe(
-    src  = sprintf("https://www.tiktok.com/embed/v2/%s?lang=en-US", video_id),
+    src  = sprintf("https://www.tiktok.com/embed/v2/%s?lang=en-US&autoplay=1&muted=0", video_id),
     width = "480", height = "852",
     style = "border:none; width:100%; max-width: 520px; aspect-ratio: 9/16;",
     allow = "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share",
@@ -307,7 +307,7 @@ question_spec <- list(
   
   # Raid & agencies
   list(id="big_raid", type="radio", label="Big raid?", choices=c("No"="0","Yes"="1")),
-  list(id="federal_agencies", type="select", label="Federal agencies involved",
+  list(id="federal_agencies", type="checkbox", label="Federal agencies involved",
        choices=c("ICE","CBP","DEA","ATF","FBI","national_guard","other_unclear")),
   
   # Local police + conditional agency text
@@ -338,8 +338,8 @@ question_spec <- list(
   list(id="bystander_count_visible", type="text", label="Bystanders visible (count)"),
   list(id="bystander_est", type="select", label="Estimated crowd size",
        choices=c("<5","5-9","10-19","20+")),
-  list(id="bystander_other_phones_visible_count", type="text",
-       label="Other recording phones visible (count)"),
+  list(id="bystander_other_phones_cameras_visible_count", type="text",
+       label="Other recording phones/cameras visible (count)"),
   
   # Bystander actions (all binary unless noted)
   list(id="bystanders_engage_officers", type="radio", label="Bystanders engage officers?",
@@ -352,6 +352,8 @@ question_spec <- list(
        choices=c("No"="0","Yes"="1")),
   list(id="bystanders_legal_language_warrants", type="radio",
        label="Bystanders use legal language / mention warrants?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="bystanders_discuss_masks", type="radio", label="Does anyone talk about the officers wearing masks?",
        choices=c("No"="0","Yes"="1")),
   list(id="bystanders_yell_at_officers", type="radio", label="Bystanders yell at officers?",
        choices=c("No"="0","Yes"="1")),
@@ -382,39 +384,45 @@ question_spec <- list(
   list(id="bystanders_brieftext", type="text", label="Brief description of bystander actions"),
   
   # Outcomes (all binary)
-  list(id="outcomes_ICE_emptyhanded", type="radio", label="ICE leaves empty-handed?",
+  list(id="outcomes_ICE_emptyhanded", type="radio", label="Officers leaves empty-handed?",
        choices=c("No"="0","Yes"="1")),
   
   list(id="outcome_target_ICE_pulls_gun", type="radio", label="Officers pull gun on target?",
        choices=c("No"="0","Yes"="1")),
   list(id="outcome_target_ICE_shoves", type="radio", label="Officers shove target?",
        choices=c("No"="0","Yes"="1")),
-  list(id="outcome_target_ICE_tackles", type="radio", label="ICE tackles target?",
+  list(id="outcome_target_ICE_tackles", type="radio", label="Officers tackles target?",
        choices=c("No"="0","Yes"="1")),
-  list(id="outcome_target_ICE_restraints", type="radio", label="Restrain target physically?",
+  list(id="outcome_target_ICE_restraints", type="radio", label="Officers restrain target physically?",
        choices=c("No"="0","Yes"="1")),
   list(id="outcome_target_ICE_punches_or_kicks", type="radio",
        label="Officers punch/kick target?", choices=c("No"="0","Yes"="1")),
   list(id="outcomes_target_arrest_binary", type="radio", label="Target arrested?",
        choices=c("No"="0","Yes"="1")),
   
-  list(id="outcome_bystander_ICE_pulls_gun", type="radio", label="Pull gun on bystander?",
+  list(id="outcome_bystander_ICE_pulls_gun", type="radio", label="Officers pull gun on bystander?",
        choices=c("No"="0","Yes"="1")),
-  list(id="outcome_bystander_ICE_shoves", type="radio", label="Shove bystander?",
+  list(id="outcome_bystander_ICE_shoves", type="radio", label="Officers shove bystander?",
        choices=c("No"="0","Yes"="1")),
-  list(id="outcome_bystander_ICE_tackles", type="radio", label="Tackle bystander?",
+  list(id="outcome_bystander_ICE_tackles", type="radio", label="Officers tackle bystander?",
        choices=c("No"="0","Yes"="1")),
-  list(id="outcome_bystander_ICE_restraints", type="radio", label="Restrain bystander?",
+  list(id="outcome_bystander_ICE_restraints", type="radio", label="Officers restrain bystander?",
        choices=c("No"="0","Yes"="1")),
   list(id="outcome_bystander_ICE_punches_or_kicks", type="radio",
-       label="Punch/kick bystander?", choices=c("No"="0","Yes"="1")),
+       label="Officers punch/kick bystander?", choices=c("No"="0","Yes"="1")),
+  list(id="outcome_bystander_ICE_gases" , type="radio", label="Officers use tear gas/smoke grenade on bystander?",
+       choices=c("No"="0","Yes"="1")),
   list(id="outcome_bystander_carhit", type="radio", label="Bystander hit by vehicle?",
        choices=c("No"="0","Yes"="1")),
-  list(id="outcome_bystanders_ICE_threaten", type="radio", label="ICE threatens bystanders?",
+  list(id="outcome_bystanders_ICE_threaten", type="radio", label="Officer threatens bystanders?",
        choices=c("No"="0","Yes"="1")),
-  list(id="outcome_ICE_takephone", type="radio", label="ICE takes someone’s phone?",
+  list(id="outcome_bystander_ICE_ignores", type="radio", label="Officer ignores bystanders?",
+       choices = c("No" = "0", "Yes" = "1")),
+  list(id="outcome_bystander_ICE_stepback", type="radio", label="Officer tells bystanders to step back?",
        choices=c("No"="0","Yes"="1")),
-  list(id="outcome_ICE_blockphone", type="radio", label="ICE blocks filming/observation?",
+  list(id="outcome_ICE_takephone", type="radio", label="Officer takes someone’s phone?",
+       choices=c("No"="0","Yes"="1")),
+  list(id="outcome_ICE_blockphone", type="radio", label="Officer blocks filming/observation?",
        choices=c("No"="0","Yes"="1")),
   list(id="outcome_bystanders_arrested", type="radio", label="Bystanders arrested?",
        choices=c("No"="0","Yes"="1"))
@@ -450,7 +458,7 @@ ui <- fluidPage(
   div(class = "topbar",
       div(class = "container-fluid",
           div(class = "controls",
-              h3("Bystander TikTok Coding v1", style="margin:0 1rem 0 0;"),
+              h3("Bystander Video Coding", style="margin:0 1rem 0 0;"),
               selectInput("coder_id", label = NULL, choices = CODER_NAMES,
                           width = "200px", selected = CODER_NAMES[1]),
               actionButton("load_list", "Load / Resume", class = "btn btn-primary"),
