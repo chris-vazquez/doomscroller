@@ -644,14 +644,30 @@ server <- function(input, output, session){
   save_response <- function(){
     req(rv$ready)
     r <- cur_row()
-    payload <- tibble::tibble(
-      timestamp    = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
-      coder_id     = input$coder_id %||% "",
-      index_order  = r$index_order,
-      URL          = r$URL,
-      user_id      = r$user_id,
-      video_id     = r$video_id
-    ) |> dplyr::bind_cols(as_tibble(gather_responses()))
+    
+    # 1) Answers as a single row tibble, in the exact spec order
+    ans <- tibble::as_tibble_row(gather_responses())
+    ans <- ans[, vapply(question_spec, function(q) q$id, character(1)), drop = FALSE]
+    
+    # 2) Meta block: include the two gate columns as NA so positions 7–8 stay aligned
+    meta <- tibble::tibble(
+      timestamp     = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+      coder_id      = input$coder_id %||% "",
+      index_order   = as.character(r$index_order),  # keep consistent type with flag writes
+      URL           = r$URL,
+      user_id       = r$user_id,
+      video_id      = r$video_id,
+      relevant_video = NA_character_,
+      link_active    = NA_character_
+    )
+    
+    # 3) Final payload: meta (8 cols) + answers (all question cols)
+    payload <- dplyr::bind_cols(meta, ans)
+    
+    # Optional safety: enforce exact header order if you want to be bulletproof
+    # resp_expected <- c("timestamp","coder_id","index_order","URL","user_id","video_id","relevant_video","link_active",
+    #                    vapply(question_spec, function(q) q$id, character(1)))
+    # payload <- payload[, resp_expected, drop = FALSE]
     
     tryCatch({
       googlesheets4::sheet_append(ss = rv$ss, data = payload, sheet = RESPONSES_TAB)
@@ -662,6 +678,8 @@ server <- function(input, output, session){
       FALSE
     })
   }
+  
+  
   observeEvent(input$save_and_next, {
     ok <- save_response()
     if (ok) showNotification("Saved.", type = "message", duration = 1.5)
