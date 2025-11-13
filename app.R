@@ -1,4 +1,4 @@
-# TikTok Doomscroller v0.1
+# TikTok Doomscroller v2
 ## Author: Chris Vazquez (chris_v@mit.edu)
 ### A Shiny app to help coders manually review TikTok videos from a list of URLs in a Google Sheet
 
@@ -15,52 +15,68 @@ library(tidyverse)
 library(googlesheets4)
 library(shinyjs)
 
+# Google Sheet 
+SHEET_URL <- Sys.getenv("SHEET_URL")
+
 # Tabs in the Google sheet:
 ASSIGN_TAB    <- Sys.getenv("ASSIGN_TAB",    unset = "assignments")
 RESPONSES_TAB <- Sys.getenv("RESPONSES_TAB", unset = "responses")
 CURSOR_TAB    <- Sys.getenv("CURSOR_TAB",    unset = "cursors")
 
-# RA Names
-# FIXME: replace with real names
+# RA Names for the dropdown menu
 CODER_NAMES <- c("Cami", "Claire", "Evan", "Minerva", "Mona", "Sarita", "Chris")
 
-# safe null-coalescing
+# safe null-coalescing for utility
 `%||%` <- function(x, y) if (is.null(x) || length(x) == 0) y else x
 
-# Error Tracing
-# FIXME: Remove after finished
-options(shiny.fullstacktrace = TRUE)
-
+# Personal error tracing for local dev
+if (interactive()) options(shiny.fullstacktrace = TRUE)
 
 
 # ----- Authentication -----
 
-# Google Sheet
-SHEET_URL <- "https://docs.google.com/spreadsheets/d/1BdZ-Ikbd-7yvS8CmrXLTtAHO6k_Hxi6hraanp_svoCY/edit?usp=sharing"
+# accessing the JSON key
+auth_gsheets <- function() {
+  sa <- Sys.getenv("GCP_SA_JSON", unset = "")
 
-# Authentication from Google
-sa <- Sys.getenv("GCP_SA_JSON", unset = "service-account.json") 
-
-if (nzchar(sa)) {
-  if (file.exists(sa)) {
-    # Case A: you set GCP_SA_JSON to "service-account.json" and bundled the file
-    gs4_auth(path = sa)
-  } else {
-    # Case B: you pasted the JSON contents into the env var
+# this is so that authentication can happen locally or when deployed
+# not necessary to run but necessary to be flexible while developing
+  if (nzchar(sa)) {
+    # Case A: env var points to a file
+    if (file.exists(sa)) {
+      googlesheets4::gs4_auth(path = sa)
+      message("✔ Authenticated with service account (file).")
+      return(invisible(TRUE))
+    }
+    
+    # Case B: env var contains JSON contents directly
     tf <- tempfile(fileext = ".json")
-    writeLines(sa, tf)
-    gs4_auth(path = tf)
+    writeLines(sa, tf, useBytes = TRUE)
+    googlesheets4::gs4_auth(path = tf)
+    message("✔ Authenticated with service account (from env string).")
+    return(invisible(TRUE))
   }
-} else {
-  # Local dev convenience (will NOT run on shinyapps.io if env var is set)
-  options(gargle_oauth_email = TRUE)
-  gs4_auth(cache = ".secrets")
+  
+  # Local development fallback: OAuth sign-in
+  if (interactive()) {
+    options(gargle_oauth_email = TRUE)
+    googlesheets4::gs4_auth(cache = ".secrets")
+    message("✔ Authenticated via OAuth (local development).")
+    return(invisible(TRUE))
+  }
+  
+  # Fail fast if deployed without credentials
+  stop("❌ GCP_SA_JSON not set. Configure a service account before deploying.")
 }
+
+# Authenticate once at startup
+auth_gsheets()
 
 
 # ----- Helper Functions -----
+# Small utilities used across the app structure
 
-# Parse TikTok bits from URLs
+# Parse info from TikTok URLs
 extract_video_id <- function(url) {
   id <- stringr::str_match(url, "/video/([0-9]{8,})")[,2]
   id
@@ -70,7 +86,7 @@ extract_user_id <- function(url) {
   uid
 }
 
-# Embed player
+# Embed player that returns the iframe for playing the video
 make_tiktok_iframe <- function(video_id){
   req(video_id)
   tags$iframe(
@@ -82,7 +98,7 @@ make_tiktok_iframe <- function(video_id){
   )
 }
 
-# Build canonical TikTok URL (no query params)
+# These functions are to help with cleaning URLs
 canonical_tiktok_url <- function(user_id, video_id) {
   user_id  <- as.character(user_id)
   video_id <- as.character(video_id)
@@ -92,102 +108,125 @@ canonical_tiktok_url <- function(user_id, video_id) {
   out
 }
 
-# Strip query string and fragments from any URL
 strip_query <- function(url) {
   url <- as.character(url)
   sub("([?#].*)$", "", url)
 }
 
-# Ensure required tabs exist with the correct headers (and fix if mismatched)
-ensure_tabs <- function(ss){
-  nms <- tryCatch(googlesheets4::sheet_names(ss), error = function(e) character())
+# Creates tabs if missing, ensure expected headers are there
+ensure_tabs <- function(ss) {
+  # Helper: get tab names (empty vector on error)
+  tab_names <- tryCatch(googlesheets4::sheet_names(ss), error = function(e) character())
   
-  get_headers <- function(tab) names(googlesheets4::read_sheet(ss, sheet = tab, n_max = 0, .name_repair = "minimal"))
-  write_headers <- function(tab, headers) {
-    df <- as.data.frame(matrix(headers, nrow = 1), stringsAsFactors = FALSE)
-    googlesheets4::range_write(ss, data = df, sheet = tab, range = "A1", col_names = FALSE)
+  # Helper: read header-only (no rows) with minimal name repair
+  header_of <- function(tab) {
+    names(googlesheets4::read_sheet(ss, sheet = tab, n_max = 0, .name_repair = "minimal"))
   }
   
-  # >>> UPDATED: add gate flags to responses header <<<
+  # Helper: write a header row into an empty tab
+  write_header_row <- function(tab, headers) {
+    empty_df <- tibble::as_tibble_row(setNames(rep(list(character()), length(headers)), headers))[0, ]
+    googlesheets4::sheet_write(empty_df, ss = ss, sheet = tab)
+  }
+  
+  # Expected headers for RESPONSES; if you define question_header(), include its names
   resp_expected <- c(
-    "timestamp","coder_id","index_order","URL","user_id","video_id",
-    "relevant_video","link_active",              # <-- NEW
-    names(question_header())
+    "timestamp", "coder_id", "index_order", "URL", "user_id", "video_id",
+    "relevant_video", "link_active"
   )
-  if(!(RESPONSES_TAB %in% nms)){
+  if (exists("question_header") && is.function(question_header)) {
+    resp_expected <- c(resp_expected, names(question_header()))
+  }
+  
+  # RESPONSES tab
+  if (!(RESPONSES_TAB %in% tab_names)) {
     googlesheets4::sheet_add(ss, RESPONSES_TAB)
-    googlesheets4::sheet_write(tibble::as_tibble_row(setNames(rep(list(character()), length(resp_expected)), resp_expected))[0,],
-                               ss = ss, sheet = RESPONSES_TAB)
+    write_header_row(RESPONSES_TAB, resp_expected)
   } else {
-    hdr <- get_headers(RESPONSES_TAB)
+    hdr <- header_of(RESPONSES_TAB)
     if (!identical(hdr, resp_expected)) {
-      if (nrow(googlesheets4::read_sheet(ss, sheet = RESPONSES_TAB, .name_repair = "minimal")) == 0) {
-        write_headers(RESPONSES_TAB, resp_expected)
-      } else if (!"index_order" %in% hdr && all(c("index_random","index_source") %in% hdr)) {
-        write_headers(RESPONSES_TAB, resp_expected)
-      }
-    }
-  }
-  
-  # ASSIGNMENTS
-  assign_expected <- c("coder_id","index_order","URL","user_id","video_id")
-  if(!(ASSIGN_TAB %in% nms)){
-    googlesheets4::sheet_add(ss, ASSIGN_TAB)
-    googlesheets4::sheet_write(tibble::as_tibble_row(setNames(rep(list(character()), length(assign_expected)), assign_expected))[0,],
-                               ss = ss, sheet = ASSIGN_TAB)
-  } else {
-    hdr <- get_headers(ASSIGN_TAB)
-    if (!identical(hdr, assign_expected)) {
-      stop("The 'assignments' tab must have headers: ", paste(assign_expected, collapse = ", "))
-    }
-  }
-  
-  # CURSORS
-  cursor_expected <- c("coder_id","index_order","video_id","started_at")
-  if(!(CURSOR_TAB %in% nms)){
-    googlesheets4::sheet_add(ss, CURSOR_TAB)
-    googlesheets4::sheet_write(tibble::as_tibble_row(setNames(rep(list(character()), length(cursor_expected)), cursor_expected))[0,],
-                               ss = ss, sheet = CURSOR_TAB)
-  } else {
-    hdr <- get_headers(CURSOR_TAB)
-    if (!identical(hdr, cursor_expected)) {
-      # Safe to rewrite if empty
-      if (nrow(googlesheets4::read_sheet(ss, sheet = CURSOR_TAB, .name_repair = "minimal")) == 0) {
-        write_headers(CURSOR_TAB, cursor_expected)
+      # If empty, rewrite header; if non-empty, attempt a gentle upgrade or stop
+      rs <- googlesheets4::read_sheet(ss, sheet = RESPONSES_TAB, .name_repair = "minimal")
+      if (nrow(rs) == 0) {
+        write_header_row(RESPONSES_TAB, resp_expected)
       } else {
-        # minimally ensure required columns exist; we won't rewrite non-empty sheets abruptly
-        missing <- setdiff(cursor_expected, hdr)
+        missing <- setdiff(resp_expected, hdr)
         if (length(missing)) {
-          stop("The 'cursors' tab is missing columns: ", paste(missing, collapse = ", "),
-               ". Please fix the header row.")
+          stop(
+            "The '", RESPONSES_TAB, "' tab is missing required columns: ",
+            paste(missing, collapse = ", "),
+            ". Please fix the header row."
+          )
         }
       }
     }
   }
+  
+  # ASSIGNMENTS tab
+  assign_expected <- c("coder_id", "index_order", "URL", "user_id", "video_id")
+  if (!(ASSIGN_TAB %in% tab_names)) {
+    googlesheets4::sheet_add(ss, ASSIGN_TAB)
+    write_header_row(ASSIGN_TAB, assign_expected)
+  } else {
+    hdr <- header_of(ASSIGN_TAB)
+    if (!identical(hdr, assign_expected)) {
+      stop(
+        "The '", ASSIGN_TAB, "' tab must have headers: ",
+        paste(assign_expected, collapse = ", ")
+      )
+    }
+  }
+  
+  # CURSORS tab (one row per coder; we overwrite their latest row)
+  cursor_expected <- c("coder_id", "index_order", "video_id", "started_at")
+  if (!(CURSOR_TAB %in% tab_names)) {
+    googlesheets4::sheet_add(ss, CURSOR_TAB)
+    write_header_row(CURSOR_TAB, cursor_expected)
+  } else {
+    hdr <- header_of(CURSOR_TAB)
+    if (!identical(hdr, cursor_expected)) {
+      cr <- googlesheets4::read_sheet(ss, sheet = CURSOR_TAB, .name_repair = "minimal")
+      if (nrow(cr) == 0) {
+        write_header_row(CURSOR_TAB, cursor_expected)
+      } else {
+        missing <- setdiff(cursor_expected, hdr)
+        if (length(missing)) {
+          stop(
+            "The '", CURSOR_TAB, "' tab is missing columns: ",
+            paste(missing, collapse = ", "),
+            ". Please fix the header row."
+          )
+        }
+      }
+    }
+  }
+  
+  invisible(TRUE)
 }
 
-
-# Pull one coder's ordered list from ASSIGNMENTS
-read_assignments_for <- function(ss, coder_id){
+# Pull a coder's ordered assignment list from ASSIGNMENTS and normalize columns.
+read_assignments_for <- function(ss, coder_id) {
   df <- googlesheets4::read_sheet(ss, sheet = ASSIGN_TAB, .name_repair = "minimal")
   validate(need(nrow(df) > 0, "Assignments tab is empty. Add rows to 'assignments'."))
+  
   df <- df %>%
     dplyr::filter(coder_id == !!coder_id) %>%
     dplyr::mutate(
-      URL = trimws(as.character(URL)),
+      URL      = trimws(as.character(URL)),
       video_id = dplyr::if_else(is.na(video_id) | video_id == "", extract_video_id(URL), video_id),
       user_id  = dplyr::if_else(is.na(user_id)  | user_id  == "", extract_user_id(URL),  user_id),
-      canonical_url = dplyr::coalesce(canonical_tiktok_url(user_id, video_id),
-                               strip_query(URL))
+      canonical_url = dplyr::coalesce(canonical_tiktok_url(user_id, video_id), strip_query(URL))
     ) %>%
     dplyr::arrange(index_order)
+  
   validate(need(nrow(df) > 0, sprintf("No assignments for coder '%s' in 'assignments'.", coder_id)))
   df
 }
 
-# Which items this coder has completed (by index_order)
-read_completed_idx <- function(ss, coder_id){
-  if(!(RESPONSES_TAB %in% googlesheets4::sheet_names(ss))) return(integer(0))
+# Return sorted unique index_order values coder has completed (from RESPONSES)
+read_completed_idx <- function(ss, coder_id) {
+  if (!(RESPONSES_TAB %in% googlesheets4::sheet_names(ss))) return(integer(0))
+  
   rs <- googlesheets4::read_sheet(ss, sheet = RESPONSES_TAB, .name_repair = "minimal")
   if (!"index_order" %in% names(rs)) return(integer(0))
   
@@ -195,19 +234,18 @@ read_completed_idx <- function(ss, coder_id){
     dplyr::filter(coder_id == !!coder_id) %>%
     dplyr::pull(index_order)
   
-  # flatten and coerce robustly
   idx <- suppressWarnings(as.integer(as.character(unlist(idx))))
   idx <- idx[!is.na(idx)]
   sort(unique(idx))
 }
 
-# Cursors: read/set/clear (one row per coder_id)
-read_cursor <- function(ss, coder_id){
+read_cursor <- function(ss, coder_id) {
   crs <- googlesheets4::read_sheet(ss, sheet = CURSOR_TAB, .name_repair = "minimal")
   crs %>% dplyr::filter(coder_id == !!coder_id) %>% dplyr::slice_tail(n = 1)
 }
 
-set_cursor <- function(ss, coder_id, index_order, video_id){
+# Upsert cursor: if coder has no row, append; else overwrite their last row.
+set_cursor <- function(ss, coder_id, index_order, video_id) {
   crs <- googlesheets4::read_sheet(ss, sheet = CURSOR_TAB, .name_repair = "minimal")
   now <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
   row <- tibble::tibble(
@@ -216,34 +254,47 @@ set_cursor <- function(ss, coder_id, index_order, video_id){
     video_id    = video_id,
     started_at  = now
   )
-  if(nrow(crs) == 0 || !(coder_id %in% crs$coder_id)){
+  
+  if (nrow(crs) == 0 || !(coder_id %in% crs$coder_id)) {
+    # First time we see this coder → append
     googlesheets4::sheet_append(ss, data = row, sheet = CURSOR_TAB)
-  } else {
-    crs$.__row__ <- seq_len(nrow(crs)) + 1L  # +1 for header
-    hit <- crs %>% dplyr::filter(coder_id == !!coder_id) %>% dplyr::slice_tail(n = 1)
-    googlesheets4::range_write(
-      ss, data = row, sheet = CURSOR_TAB,
-      range = paste0("A", hit$.__row__[1]), col_names = FALSE
-    )
+    return(invisible(TRUE))
   }
+  
+  # Overwrite the most recent row for this coder (preserves "one row per coder" contract)
+  crs$.__row__ <- seq_len(nrow(crs)) + 1L  # +1 for header
+  hit <- crs %>% dplyr::filter(coder_id == !!coder_id) %>% dplyr::slice_tail(n = 1)
+  
+  googlesheets4::range_write(
+    ss, data = row, sheet = CURSOR_TAB,
+    range = paste0("A", hit$.__row__[1]), col_names = FALSE
+  )
+  invisible(TRUE)
 }
 
-clear_cursor <- function(ss, coder_id){
+# Clear cursor by overwriting coder's row with a neutral record (index 0, blank video)
+clear_cursor <- function(ss, coder_id) {
   crs <- googlesheets4::read_sheet(ss, sheet = CURSOR_TAB, .name_repair = "minimal")
-  if(nrow(crs) == 0 || !(coder_id %in% crs$coder_id)) return(invisible())
+  if (nrow(crs) == 0 || !(coder_id %in% crs$coder_id)) return(invisible())
+  
   crs$.__row__ <- seq_len(nrow(crs)) + 1L
   hit <- crs %>% dplyr::filter(coder_id == !!coder_id) %>% dplyr::slice_tail(n = 1)
+  
   row <- tibble::tibble(
     coder_id    = coder_id,
     index_order = 0L,
     video_id    = "",
     started_at  = format(Sys.time(), "%Y-%m-%d %H:%M:%S")
   )
+  
   googlesheets4::range_write(
     ss, data = row, sheet = CURSOR_TAB,
     range = paste0("A", hit$.__row__[1]), col_names = FALSE
   )
+  invisible(TRUE)
 }
+
+
 
 # Header Correction when needed
 ##migrate_responses_header <- function(ss) {
@@ -425,7 +476,9 @@ question_spec <- list(
   list(id="outcome_ICE_blockphone", type="radio", label="Officer blocks filming/observation?",
        choices=c("No"="0","Yes"="1")),
   list(id="outcome_bystanders_arrested", type="radio", label="Bystanders arrested?",
-       choices=c("No"="0","Yes"="1"))
+       choices=c("No"="0","Yes"="1")),
+  list(id="other_comments", type="textArea",
+       label="Additional comments?")
 )
 question_header <- function(){
   tibble::tibble(!!!setNames(rep(list(character()), length(question_spec)),
@@ -514,8 +567,6 @@ server <- function(input, output, session){
     ready   = FALSE
   )
   
-  # >>> REMOVED: Right-arrow hotkey and skip trigger
-  # runjs(...) and observeEvent(input$`_k_next`, ...)  -- delete both
   
   observeEvent(input$load_list, {
     req(input$coder_id)
@@ -524,18 +575,19 @@ server <- function(input, output, session){
     rv$ss <- SHEET_URL
     ensure_tabs(rv$ss)
     
-    assign_df <- read_assignments_for(rv$ss, input$coder_id)
-    rv$data <- assign_df
+    # pull assignments for this coder
+    rv$data <- read_assignments_for(rv$ss, input$coder_id)
     
+    # figure out where to start: cursor if present, else first remaining item
     cur <- read_cursor(rv$ss, input$coder_id)
     completed_idx <- read_completed_idx(rv$ss, input$coder_id)
     
-    if(nrow(cur) > 0 && !is.na(cur$index_order) && cur$index_order > 0){
+    if (nrow(cur) > 0 && !is.na(cur$index_order) && cur$index_order > 0) {
       pos <- which(rv$data$index_order == cur$index_order)[1]
       rv$idx_pos <- ifelse(length(pos) == 1, pos, 1L)
     } else {
       remaining <- setdiff(rv$data$index_order, completed_idx)
-      if(length(remaining) == 0){
+      if (length(remaining) == 0) {
         rv$idx_pos <- 1L
         showNotification("All assigned videos are completed. 🎉", type = "message")
       } else {
@@ -548,21 +600,49 @@ server <- function(input, output, session){
     rv$ready <- TRUE
   })
   
+  # Current row (safe single-row tibble)
   cur_row <- reactive({
     req(rv$ready)
     rv$data[rv$idx_pos, , drop = FALSE]
   })
   
+  # compute next position from sheet state (uses completed rows)
+  next_position <- function() {
+    completed_idx <- read_completed_idx(rv$ss, input$coder_id)
+    remaining <- setdiff(rv$data$index_order, completed_idx)
+    if (length(remaining) == 0) return(NA_integer_)
+    target <- min(remaining)
+    which(rv$data$index_order == target)[1]
+  }
+  
+  # reset all question inputs to blank/empty
+  reset_question_inputs <- function() {
+    lapply(question_spec, function(q){
+      switch(q$type,
+             radio    = updateRadioButtons(session, q$id, selected = character(0)),
+             text     = updateTextInput(session, q$id, value = ""),
+             textArea = updateTextAreaInput(session, q$id, value = ""),
+             checkbox = updateCheckboxGroupInput(session, q$id, selected = character(0)),
+             select   = updateSelectInput(session, q$id, selected = ""),
+             NULL
+      )
+    })
+    invisible(TRUE)
+  }
+  
+  # For UI text bits
   output$position <- renderText({
     req(rv$ready)
     paste0("Item ", rv$idx_pos, " of ", nrow(rv$data))
   })
+  
   output$current_info <- renderText({
     req(rv$ready)
     r <- cur_row()
     paste0("(index ", r$index_order, " • video ", r$video_id, ")")
   })
   
+  # Embed the video
   output$embed <- renderUI({
     req(rv$ready)
     vid <- cur_row()$video_id
@@ -570,19 +650,19 @@ server <- function(input, output, session){
     make_tiktok_iframe(vid)
   })
   
-  # >>> Radios start blank (selected = character(0)); URL is clickable link
+  # Questionnaire UI
   output$questionnaire <- renderUI({
     req(rv$ready)
     r <- cur_row()
     tagList(
-      div(style="margin-bottom:.5rem; font-size:.9rem; word-break:break-all;",
+      div(style = "margin-bottom:.5rem; font-size:.9rem; word-break:break-all;",
           strong("Original: "),
           tags$a(href = r$canonical_url, target = "_blank", r$canonical_url)
       ),
       lapply(question_spec, function(q){
         switch(q$type,
                radio    = radioButtons(q$id, q$label, choices = q$choices, inline = TRUE,
-                                       selected = character(0)),  # <-- start blank
+                                       selected = character(0)),  # start blank
                text     = textInput(q$id, q$label),
                textArea = textAreaInput(q$id, q$label, rows = 4),
                checkbox = checkboxGroupInput(q$id, q$label, choices = q$choices),
@@ -593,7 +673,7 @@ server <- function(input, output, session){
     )
   })
   
-  # >>> Allow unclicking radios (toggle off on second click)
+  # Javascript to allow unchecking buttons in the questionnaire
   runjs("
     $(document).on('click', '.shiny-input-radiogroup input[type=radio]', function(){
       var $this = $(this);
@@ -606,68 +686,51 @@ server <- function(input, output, session){
     });
   ")
   
+  # Collect answers 
   gather_responses <- function(){
+    ids <- vapply(question_spec, function(q) q$id, character(1))
     vals <- lapply(question_spec, function(q){
       v <- input[[q$id]]
       if (is.null(v)) "" else if (is.character(v)) paste(v, collapse = ", ") else as.character(v)
     })
-    setNames(as.list(vals), vapply(question_spec, function(q) q$id, character(1)))
+    out <- tibble::as_tibble_row(setNames(vals, ids))
+    out[, ids, drop = FALSE]
   }
   
-  # >>> Advance helper (shared)
+  # Move to next item (updates cursor + resets inputs)
   advance_to_next <- function(){
     req(rv$ready)
-    completed_idx <- read_completed_idx(rv$ss, input$coder_id)
-    remaining <- setdiff(rv$data$index_order, completed_idx)
-    if (length(remaining) == 0) {
+    pos <- next_position()
+    if (is.na(pos)) {
       clear_cursor(rv$ss, input$coder_id)
       showNotification("Saved. All done! 🎉", type = "message")
-    } else {
-      next_idx_order <- min(remaining)
-      rv$idx_pos <- which(rv$data$index_order == next_idx_order)[1]
-      set_cursor(rv$ss, input$coder_id, next_idx_order, rv$data$video_id[[rv$idx_pos]])
-      lapply(question_spec, function(q){
-        switch(q$type,
-               radio    = updateRadioButtons(session, q$id, selected = character(0)),
-               text     = updateTextInput(session, q$id, value = ""),
-               textArea = updateTextAreaInput(session, q$id, value = ""),
-               checkbox = updateCheckboxGroupInput(session, q$id, selected = character(0)),
-               select   = updateSelectInput(session, q$id, selected = "")
-        )
-      })
+      return(invisible(FALSE))
     }
+    rv$idx_pos <- pos
+    r <- cur_row()
+    set_cursor(rv$ss, input$coder_id, r$index_order, r$video_id)
+    reset_question_inputs()
+    invisible(TRUE)
   }
   
-  # >>> REMOVED: observeEvent(input$skip, ...)
   
-  # Save full response and move next (unchanged)
+  # Save full response and advance
   save_response <- function(){
     req(rv$ready)
     r <- cur_row()
     
-    # 1) Answers as a single row tibble, in the exact spec order
-    ans <- tibble::as_tibble_row(gather_responses())
-    ans <- ans[, vapply(question_spec, function(q) q$id, character(1)), drop = FALSE]
-    
-    # 2) Meta block: include the two gate columns as NA so positions 7–8 stay aligned
     meta <- tibble::tibble(
-      timestamp     = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
-      coder_id      = input$coder_id %||% "",
-      index_order   = as.character(r$index_order),  # keep consistent type with flag writes
-      URL           = r$URL,
-      user_id       = r$user_id,
-      video_id      = r$video_id,
-      relevant_video = NA_character_,
+      timestamp      = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+      coder_id       = input$coder_id %||% "",
+      index_order    = as.character(r$index_order),  # keep consistent type with flag writes
+      URL            = r$URL,
+      user_id        = r$user_id,
+      video_id       = r$video_id,
+      relevant_video = NA_character_,                # left blank when saving full survey
       link_active    = NA_character_
     )
     
-    # 3) Final payload: meta (8 cols) + answers (all question cols)
-    payload <- dplyr::bind_cols(meta, ans)
-    
-    # Optional safety: enforce exact header order if you want to be bulletproof
-    # resp_expected <- c("timestamp","coder_id","index_order","URL","user_id","video_id","relevant_video","link_active",
-    #                    vapply(question_spec, function(q) q$id, character(1)))
-    # payload <- payload[, resp_expected, drop = FALSE]
+    payload <- dplyr::bind_cols(meta, gather_responses())
     
     tryCatch({
       googlesheets4::sheet_append(ss = rv$ss, data = payload, sheet = RESPONSES_TAB)
@@ -681,51 +744,57 @@ server <- function(input, output, session){
   
   
   observeEvent(input$save_and_next, {
-    ok <- save_response()
-    if (ok) showNotification("Saved.", type = "message", duration = 1.5)
-  })
+    if (isTRUE(save_response())) {
+      showNotification("Saved.", type = "message", duration = 1.5)
+    }
+  }, ignoreInit = TRUE)
   
-  # >>> NEW: mark & advance helpers
+  # Quick flag rows (irrelevant / link broken) and advance; answer columns remain blank
   save_flag_and_advance <- function(flag_col, flag_value){
     req(rv$ready)
     r <- cur_row()
-    meta <- list(
-      timestamp   = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
-      coder_id    = input$coder_id %||% "",
-      index_order = r$index_order,
-      URL         = r$URL,
-      user_id     = r$user_id,
-      video_id    = r$video_id
-    )
     
-    # Build payload with first 8 columns EXACTLY matching the sheet order.
-    # (remaining question columns will stay blank in the sheet, which is fine)
     payload <- tibble::tibble(
-      timestamp    = meta$timestamp,
-      coder_id     = meta$coder_id,
-      index_order  = as.character(meta$index_order),
-      URL          = meta$URL,
-      user_id      = meta$user_id,
-      video_id     = meta$video_id,
+      timestamp      = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+      coder_id       = input$coder_id %||% "",
+      index_order    = as.character(r$index_order),
+      URL            = r$URL,
+      user_id        = r$user_id,
+      video_id       = r$video_id,
       relevant_video = if (identical(flag_col, "relevant_video")) flag_value else NA_character_,
       link_active    = if (identical(flag_col, "link_active"))    flag_value else NA_character_
     )
     
-    googlesheets4::sheet_append(ss = rv$ss, data = payload, sheet = RESPONSES_TAB)
-    advance_to_next()
+    tryCatch({
+      googlesheets4::sheet_append(ss = rv$ss, data = payload, sheet = RESPONSES_TAB)
+      advance_to_next()
+      TRUE
+    }, error = function(e){
+      showNotification(paste("Write error:", e$message), type = "error", duration = 8)
+      FALSE
+    })
   }
   
   observeEvent(input$mark_irrelevant, {
-    save_flag_and_advance("relevant_video", "No")
-    showNotification("Marked irrelevant and advanced.", type = "message")
-  })
+    if (isTRUE(save_flag_and_advance("relevant_video", "No"))) {
+      showNotification("Marked irrelevant and advanced.", type = "message")
+    }
+  }, ignoreInit = TRUE)
+  
   observeEvent(input$mark_link_broken, {
-    save_flag_and_advance("link_active", "No")
-    showNotification("Marked link broken and advanced.", type = "message")
+    if (isTRUE(save_flag_and_advance("link_active", "No"))) {
+      showNotification("Marked link broken and advanced.", type = "message")
+    }
+  }, ignoreInit = TRUE)
+  
+  # Clear cursor on disconnect
+  session$onSessionEnded(function() {
+    if (!isTruthy(input$coder_id)) return(invisible())
+    try(clear_cursor(rv$ss, input$coder_id), silent = TRUE)
   })
 }
 
-# Add this line when adding new questions
+# Add this line when adding new questions?
 ##migrate_responses_header(SHEET_URL)
 
 shinyApp(ui, server)
